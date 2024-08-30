@@ -1,0 +1,914 @@
+
+```{r}
+title: "WGCNA_biginning"
+author: "YAYA-OYE AKIBOU"
+date: "2024-04-17"
+output: html_document
+```
+ 
+```{r} setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(DESeq2)
+library(vroom )
+library(WGCNA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(tibble)  
+library(tidyr)
+library(VennDiagram)
+library(pheatmap)
+library(reshape2) 
+
+# Chemins d'accès
+folder_path <- "D:/data_umr_1227/Par_pureté_cyto_digitale"
+
+output_folder <- file.path(folder_path, "WGCNA_analysis")
+
+
+# Créer le dossier si ce n'est pas déjà fait
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+
+cat("Step 1 : Chargements des fichiers necéssaires   ...\n")
+
+raw_count_data <- read.table(file.path(folder_path, "ALL_SORTED_CELLS_MATRIX_SYMBOL.tsv"), row.names = 1, check.names = FALSE)
+
+meta_data <- vroom(file.path(folder_path, "METADATA_SORTED_CELL_MCPcounter.tsv"), delim = '\t')
+data_clinical<- vroom(file.path(folder_path, "CLINICAL_NUMERIC_STRD_SJS.tsv"), delim = '\t')
+
+data_norm_BLymphocytes <- read.csv(file.path(folder_path,  "BLymphocytes_DESeq", "VST_normalized_all_sampleBLymphocytes_DESeq.csv"), check.names = FALSE, row.names = 1)
+
+data_norm_TLymphocytes <- read.csv(file.path(folder_path, "TLymphocytes_DESeq", "VST_normalized_all_sampleTLymphocytes_DESeq.csv"), check.names = FALSE, row.names = 1)
+
+data_norm_Monocytes <- read.csv(file.path(folder_path, "Monocytes_DESeq", "VST_normalized_all_sampleMonocytes_DESeq.csv"), check.names = FALSE, row.names = 1)
+
+data_norm_Neutrophils <- read.csv(file.path(folder_path, "Neutrophils_DESeq","VST_normalized_all_sampleNeutrophils_DESeq.csv"), check.names = FALSE, row.names = 1)
+
+cat("Step 2 : filtrage des tableaux des comptes normalisées pour ne garder que les individus communs au 4 types cellulaires  ...\n")
+
+# Extraction des parties numériques des noms de colonnes
+extract_numeric_part <- function(col_names) {
+  sapply(strsplit(col_names, "_"), function(x) x[1])
+}
+
+data_norm_BLymphocytes_filter <- extract_numeric_part(colnames(data_norm_BLymphocytes))
+data_norm_TLymphocytes_filter <- extract_numeric_part(colnames(data_norm_TLymphocytes))
+data_norm_Monocytes_filter <- extract_numeric_part(colnames(data_norm_Monocytes))
+data_norm_Neutrophils_filter <- extract_numeric_part(colnames(data_norm_Neutrophils))
+
+#  colonnes communes
+common_columns <- Reduce(intersect, list(data_norm_BLymphocytes_filter, data_norm_TLymphocytes_filter, data_norm_Monocytes_filter, data_norm_Neutrophils_filter))
+
+# Filtrqge des tableaux pour ne conserver que les colonnes communes
+filter_common_columns <- function(data, common_columns) {
+  colnames_to_keep <- colnames(data)[extract_numeric_part(colnames(data)) %in% common_columns]
+  data[, colnames_to_keep, drop = FALSE]
+}
+
+data_norm_BLymphocytes  <- filter_common_columns(data_norm_BLymphocytes, common_columns)
+data_norm_TLymphocytes <- filter_common_columns(data_norm_TLymphocytes, common_columns)
+data_norm_Monocytes <- filter_common_columns(data_norm_Monocytes, common_columns)
+data_norm_Neutrophils <- filter_common_columns(data_norm_Neutrophils, common_columns)
+
+cat("Step 3 : Selection des 5000 gènes avec la variance la plus élevé  ...\n")
+
+high_variance <- function(data, top_n = 5000) {
+  # Calcule de la variance pour chaque gène
+  gene_variances <- apply(data, 1, var)
+  # Ordre des gènes par variance décroissante et sélection des 5000 
+  top_genes <- order(gene_variances, decreasing = TRUE)[1:top_n]
+  # données filtrées avec les gènes sélectionnés
+  return(data[top_genes, ])
+}
+
+data_norm_BLymphocytes <- high_variance (data_norm_BLymphocytes)
+data_norm_TLymphocytes <- high_variance (data_norm_TLymphocytes)
+data_norm_Monocytes <- high_variance (data_norm_Monocytes)
+data_norm_Neutrophils <- high_variance (data_norm_Neutrophils)
+
+cat("Step 4 : Suppression des noms de lignes pour les remplacer par une colonne genes_id ...\n")
+
+# Fonction de transformation des noms des lignes en une colonne gene_id
+transform_row_names <- function(data) {
+  data$gene_id <- rownames(data)
+  data <- data[, c(ncol(data), 1:(ncol(data)-1))]
+  rownames(data) <- NULL
+  return(data)
+}
+
+# Application de la fonction de transformation pour  chaque tableau
+data_norm_BLymphocytes <- transform_row_names(data_norm_BLymphocytes)
+data_norm_TLymphocytes <- transform_row_names(data_norm_TLymphocytes)
+data_norm_Monocytes <- transform_row_names(data_norm_Monocytes)
+data_norm_Neutrophils <- transform_row_names(data_norm_Neutrophils)
+
+cat("Step 5: modification des noms des gènes pour les faire preceder de la premiere lettre du type cellulaire .\n")
+
+# Fonction pour extraction de la première lettre qui suit le caractère '_'
+extract_letter <- function(colnames) {
+  sapply(colnames, function(name) {
+    parts <- strsplit(name, "_")[[1]]
+    if (length(parts) > 1) {
+      return(substr(parts[2], 1, 1))
+    } else {
+      return("")
+    }
+  })
+}
+
+# Ajout de la lettre au début de chaque valeur de la colonne gene_id
+modify_gene_id <- function(data) {
+  letters <- extract_letter(colnames(data))
+  first_letter <- letters[2] # On suppose que toutes les colonnes après la première ont la même structure de nom
+  data$gene_id <- paste0(first_letter,"_", data$gene_id)
+  return(data)
+}
+
+# Application de la modification à chaque tableau
+data_norm_BLymphocytess<- modify_gene_id(data_norm_BLymphocytes)
+data_norm_TLymphocytess <- modify_gene_id(data_norm_TLymphocytes)
+data_norm_Monocytess <- modify_gene_id(data_norm_Monocytes)
+data_norm_Neutrophilss <- modify_gene_id(data_norm_Neutrophils)
+
+cat(" Step 6 : modification des  noms des colonnes pour ne garder que la partie numerique communs a un meme individus présents dans les 4 types cellulaires .\n")
+
+rename_columns_numeric <- function(data) {
+  colnames(data) <- gsub("[^0-9]", "", colnames(data))
+  return(data)
+}
+
+data_norm_BLymphocytess <- rename_columns_numeric(data_norm_BLymphocytess)
+data_norm_TLymphocytess <- rename_columns_numeric(data_norm_TLymphocytess)
+data_norm_Monocytess <- rename_columns_numeric(data_norm_Monocytess)
+data_norm_Neutrophilss <- rename_columns_numeric(data_norm_Neutrophilss)
+
+cat(" Step 7 :  fusion des 4 tableau des comptes  pour obtenir un seul tableau .\n")
+
+data_norm_all_cell  <- rbind(data_norm_BLymphocytess, data_norm_TLymphocytess, data_norm_Monocytess, data_norm_Neutrophilss)
+
+cat(" Step 8 : transposition des lignes en colonnes sans la premiere colonnes et attribution des valeurs de la colonne gene_symbol comme nom de colonnes .\n")
+
+# Transposition des données en ignorant la première colonne
+Tdata_norm_all_cell <- as.data.frame(t(data_norm_all_cell[, -1]))
+# Nommer les colonnes avec les valeurs de la première colonne
+names(Tdata_norm_all_cell) <- data_norm_all_cell[[1]]
+# Nommer les lignes avec les noms des colonnes originales (à l'exception de la première)
+rownames(Tdata_norm_all_cell) <- names(data_norm_all_cell)[-1]
+
+cat(" Step 9 : Vérifier la qualité des échantillons et des gènes avec option de de WGCNA  .\n")
+
+# Vérification de la qualité des échantillons et des gènes
+gsg <- goodSamplesGenes(Tdata_norm_all_cell, verbose = 3)
+
+# Retrait des gènes et échantillons de mauvaise qualité
+if (!gsg$allOK) {
+  if (sum(!gsg$goodGenes) > 0) printFlush(paste("Removing genes:", paste(names(Tdata_norm_all_cell)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples) > 0) printFlush(paste("Removing samples:", paste(rownames(Tdata_norm_all_cell)[!gsg$goodSamples], collapse = ", ")))
+  Tdata_norm_all_cell <- Tdata_norm_all_cell[gsg$goodSamples, gsg$goodGenes]
+}
+
+cat(" Step 10 : Clustering des échantillons pour détecter les outliers .\n")
+
+# Clustering des échantillons
+sampleTree <- hclust(dist(Tdata_norm_all_cell ), method = "average")
+
+# Sauvegarde du  dendrogramme des échantillons
+sizeGrWindow(16, 12)
+pdf(file = file.path(output_folder,"sample_Clustering_outliers_in_sjogren_data.pdf"), width = 12, height = 9)
+par(cex = 0.6)
+par(mar = c(4, 6, 2, 2))
+plot(sampleTree, main = "Sample clustering to detect outliers ", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+dev.off()
+
+cat(" Step 11 : Charger et préparer les données de traits cliniques.\n")
+
+#conservation des données cliniques des patients qui sont presents dans notre tableau transformé
+clinique_data <- data_clinical[data_clinical$ID %in% colnames(data_norm_all_cell), ]
+#Suppression des colonnes qui ont uniquement des valeurs NA
+clinique_data <- clinique_data %>% select_if(~ !all(is.na(.)))
+#identifications des colonnes qui ne sont pas identiques dans les deux tableaux
+missing_columns <- setdiff(colnames(data_norm_all_cell), clinique_data$ID)
+## Création  d'un data frame avec les colonnes manquantes et remplissage avec des zero 
+missing_data <- data.frame(ID = missing_columns)
+missing_data <- cbind(missing_data, setNames(data.frame(matrix(0, nrow = nrow(missing_data), ncol = ncol(clinique_data) - 1)), names(clinique_data)[-1]))
+missing_data <- missing_data[-1, ]
+# Ajout des données manquantes au donnée disponible de  clinique_data
+clinique_data <- rbind(clinique_data, missing_data)
+clinique_data <- as.data.frame(clinique_data)
+rownames(clinique_data) <- clinique_data$ID
+clinique_data <- subset(clinique_data, select = -ID)
+clinique_data[is.na(clinique_data)] <- 0
+
+cat(" Step 12 : Clustering des échantillons avec les traits cliniques.\n")
+
+# Nettoyage de la mémoire
+collectGarbage()
+# Nouveau clustering des échantillons
+sampleTree2 <- hclust(dist(Tdata_norm_all_cell), method = "average")
+# Convertion des traits cliniques en couleurs
+traitColors <- numbers2colors(clinique_data, signed = FALSE)
+# Sauvegarde du dendrogramme avec heatmap des traits
+pdf(file = file.path(output_folder, "sample_Clustering2_trait_heatmap_in_sjogren.pdf"), width = 16, height = 12)
+par(cex = 0.6)
+par(mar = c(4, 6, 2, 2))
+plotDendroAndColors(sampleTree2, traitColors, groupLabels = names(clinique_data), main = "Sample dendrogram and trait heatmap")
+dev.off()
+
+cat(" Step 13 : sauvegarde des données d'expression et cliniques.\n")
+
+# Sauvegarde des données d'expression et les traits cliniques
+save(Tdata_norm_all_cell, clinique_data, file = file.path(output_folder,"mWGCNA-01-sjogren-dataInput.RData"))
+
+cat("Step 14 : Construction du réseau et détection des modules(3h de run).\n")
+
+# Charger les données préalablement sauvegardées
+lnames <- load(file = file.path(output_folder, "mWGCNA-01-sjogren-dataInput.RData"))
+
+# Définir les puissances à tester pour le seuil de puissance
+powers <- c(c(1:10), seq(from = 12, to = 20, by = 2))
+
+# Sélectionner le seuil de puissance optimal
+sft <- pickSoftThreshold(Tdata_norm_all_cell, powerVector = powers, verbose = 5)
+
+# Afficher les résultats de la sélection du seuil de puissance et sauvegarder la visualisation
+sizeGrWindow(9, 5)
+pdf(file = file.path(output_folder, "scale_independence_mean_connectivity.pdf"), width = 9, height = 5)
+par(mfrow = c(1, 2))
+cex1 <- 0.9
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     xlab = "Soft Threshold (power)", ylab = "Scale Free Topology Model Fit, signed R^2",
+     type = "n", main = "Scale independence")
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3]) * sft$fitIndices[,2], labels = powers, cex = cex1, col = "red")
+abline(h = 0.90, col = "red")
+
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab = "Soft Threshold (power)", ylab = "Mean Connectivity",
+     type = "n", main = "Mean connectivity")
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels = powers, cex = cex1, col = "red")
+dev.off()
+
+# Construction des modules à l'aide de WGCNA
+net <- blockwiseModules(Tdata_norm_all_cell, checkMissingData = TRUE, power = sft$powerEstimate,
+                        TOMType = "unsigned", minModuleSize = 50, maxBlockSize = 20000,
+                        reassignThreshold = 0, mergeCutHeight = 0.25, numericLabels = TRUE,
+                        pamRespectsDendro = FALSE, saveTOMs = TRUE, saveTOMFileBase = "mWGCNATOM",
+                        verbose = 3)
+
+# Visualisation des résultats et sauvegarde
+sizeGrWindow(15, 15)
+pdf(file = file.path(output_folder, "module_colors_dendrogram.pdf"), width = 15, height = 15)
+table(net$colors)
+
+# Convertir les couleurs des modules en un format adapté
+mergedColors <- labels2colors(net$colors)
+
+# Afficher le dendrogramme des gènes et les couleurs des modules
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]],
+                    "Module colors", dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+dev.off()
+
+# Sauvegarder les résultats
+moduleLabels <- net$colors
+moduleColors <- labels2colors(net$colors)
+MEs <- net$MEs
+geneTree <- net$dendrograms[[1]]
+save(MEs, moduleLabels, moduleColors, geneTree, file = file.path(output_folder,"mWGCNA-02-sjogren-networkConstruction-auto.RData"))
+
+
+cat("Step 15 : Calcul des Eigengènes des modules.\n")
+
+lname <- load(file = file.path(output_folder, "mWGCNA-01-sjogren-dataInput.RData"))
+lnames <- load(file = file.path(output_folder, "mWGCNA-02-sjogren-networkConstruction-auto.RData"))
+
+nGenes = ncol(Tdata_norm_all_cell)
+nSamples = nrow(Tdata_norm_all_cell)
+
+#Calcul des Eigengènes des modules
+
+MEs0 <- moduleEigengenes(Tdata_norm_all_cell, moduleColors)$eigengenes
+MEs <- orderMEs(MEs0)
+write.csv(MEs, file = file.path(output_folder, "moduleEigengenes.csv"), row.names = TRUE)
+
+cat("Step 16 : identification des modules qui permettent de separer nos deux conditions   .\n")
+
+distribution_module <- MEs
+# Filtrer les données en fonction des conditions et conserver uniquement les colonnes 
+meta_data_df <- as.data.frame(meta_data)
+meta_data_subset <- meta_data_df %>% filter(CONDITION %in% c("SJS", "CTRL")) %>% dplyr::select(ID, CONDITION)
+meta_data_subset$ID <- gsub("^(.*)_.*", "\\1", meta_data_subset$ID)
+meta_data_subset <- distinct(meta_data_subset, ID, .keep_all = TRUE)
+distribution_module$X <- rownames(distribution_module)
+distribution_module <- merge(distribution_module, meta_data_subset, by.x = "X", by.y = "ID")
+CTRL <- distribution_module[distribution_module$CONDITION == 'CTRL', ]
+SJS  <- distribution_module[distribution_module$CONDITION == 'SJS', ]
+
+# Obtenir les noms des facteurs
+modules_ME <- colnames(distribution_module)[grep("ME", colnames(distribution_module))]
+# Initialiser un dataframe pour stocker les résultats
+results_df <- data.frame(modules = character(),
+                         Pvalue = numeric(),
+                         Padjusted = numeric(),
+                         Significativite = character(),
+                         Mean = numeric(),
+                         stringsAsFactors = FALSE)
+
+# Effectuer le test t pour chaque modules
+results_df <- data.frame()
+for (modules_name in modules_ME) {
+   ttest <- t.test(CTRL[[modules_name]], SJS[[modules_name]])
+   significant <- ifelse(p.adjust(ttest$p.value, method = "BH") < 0.05, "Significatif", "Non significatif")
+   mean_value <- mean(distribution_module[[modules_name]])
+   results_df <- rbind(results_df, data.frame(modules = modules_name,
+                                             Pvalue = ttest$p.value,
+                                             Padjusted = p.adjust(ttest$p.value, method = "BH"),
+                                             Significativite = significant,
+                                             Mean = mean_value))
+}
+
+# Sauvegarder les résultats dans un fichier CSV
+write.csv(results_df, file = file.path(output_folder, "t_test.csv"), row.names = FALSE)
+
+    
+cat("Step 17: Heatmap des corrélations entre modules et traits cliniques (Pearson et Spearman).\n")
+significant_modules <- results_df$modules[results_df$Significativite == "Significatif"]
+process_correlation <- function(method, MEs, clinique_data, output_folder, startTrait, endTrait, significant_modules) {
+  # Vérification des indices qui dépassent le nombre total de traits cliniques disponibles
+  if (startTrait < 1 || endTrait > ncol(clinique_data) || startTrait > endTrait) {
+    stop("Les indices spécifiés sont hors limites ou invalides.")
+  }
+  
+  # Sélection des colonnes de clinique_data dans l'intervalle spécifié
+  selected_clinique_data <- clinique_data[, startTrait:endTrait]
+  
+  # Filtrage des modules significatifs dans MEs
+  MEs_significant <- MEs[, significant_modules, drop = FALSE]
+  
+  # Calcul du nombre total d'échantillons
+  nSamples <- nrow(clinique_data)
+  
+  # Calcul des corrélations module-trait
+  moduleTraitCor <- cor(MEs_significant, selected_clinique_data, use = "p", method = method)
+  moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nSamples)
+  
+  # Chemin du fichier pour le heatmap
+  heatmap_file_path <- file.path(output_folder, paste("moduleTraitRelationshipsHeatmap_", method, "_", startTrait, "_to_", endTrait, ".png"))
+  
+  # Générer et sauvegarder un heatmap annoté des corrélations module-trait
+  sizeGrWindow(10, 10)
+  textMatrix <- paste(signif(moduleTraitCor, 2), sep = "")
+  dim(textMatrix) <- dim(moduleTraitCor)
+  par(mar = c(15, 15, 15, 15))
+  
+  # Enregistrement du heatmap dans un fichier PNG
+  png(heatmap_file_path, width = 1600, height = 1600, res = 150)
+  labeledHeatmap(Matrix = moduleTraitCor, xLabels = names(selected_clinique_data), yLabels = names(MEs_significant),
+                 ySymbols = names(MEs_significant), colorLabels = FALSE, colors = redWhiteGreen(50),
+                 textMatrix = textMatrix, setStdMargins = FALSE, cex.text = 0.5, zlim = c(-1, 1),
+                 main = paste("mWGCNA: Module-trait relationships (", method, ", traits ", startTrait, " to ", endTrait, ")"))
+  dev.off()
+  
+  # Sauvegarde des matrices de corrélation et de p-values ajustées dans des fichiers CSV
+  write.csv(moduleTraitCor, file = file.path(output_folder, paste("moduleTraits", method, "Cor_", startTrait, "_to_", endTrait, ".csv")), row.names = TRUE)
+  write.csv(moduleTraitPvalue, file = file.path(output_folder, paste("moduleTrait", method, "Pvalue_", startTrait, "_to_", endTrait, ".csv")), row.names = TRUE)
+}
+
+# Paramètres
+startTrait <- 161  # Indice de début
+endTrait <- 177   # Indice de fin
+
+# Appel de la fonction pour les méthodes Pearson et Spearman avec les modules significatifs
+process_correlation("pearson", MEs, clinique_data, output_folder, startTrait, endTrait, significant_modules)
+process_correlation("spearman", MEs, clinique_data, output_folder, startTrait, endTrait, significant_modules)
+
+
+cat("Step 18:  correlation entre gene et module puis pvalue et Identification du nombre de gene par type cellulaire dans chaque module significatif.\n")
+
+# Préparer les noms des modules à partir des noms des eigengènes des modules
+modNames <- substring(names(MEs), 3)
+
+# Calculer la corrélation des gènes avec les eigengènes des modules
+geneModuleMembership <- as.data.frame(cor(Tdata_norm_all_cell, MEs, use = "p"))
+
+# Calculer les p-values des corrélations
+MMPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
+
+# Renommer les colonnes pour plus de clarté
+colnames(geneModuleMembership) <- paste("MM", modNames, sep = ".")
+colnames(MMPvalue) <- paste("p.MM", modNames, sep = ".")
+
+# Ajuster les p-values en utilisant la méthode Benjamini-Hochberg (FDR)
+adjustedMMPvalue <- as.data.frame(lapply(MMPvalue, function(p) p.adjust(p, method = "BH")))
+colnames(adjustedMMPvalue) <- paste("padj.MM", modNames, sep = ".")
+rownames(adjustedMMPvalue) <- rownames(MMPvalue)
+
+# Enlever le préfixe "ME" des noms de modules significatifs
+significant_modules_clean <- gsub("^ME", "", significant_modules)
+
+# Préparer les noms de colonnes à filtrer
+column_names <- function(module_names, prefix) paste(prefix, module_names, sep = ".")
+column_names_geneModuleMembership <- column_names(significant_modules_clean, "MM")
+column_names_MMPvalue <- column_names(significant_modules_clean, "p.MM")
+column_names_adjustedMMPvalue <- column_names(significant_modules_clean, "padj.MM")
+
+# Filtrer les tableaux pour ne garder que les modules significatifs
+filtered_geneModuleMembership <- geneModuleMembership[, column_names_geneModuleMembership, drop = FALSE]
+filtered_MMPvalue <- MMPvalue[, column_names_MMPvalue, drop = FALSE]
+filtered_adjustedMMPvalue <- adjustedMMPvalue[, column_names_adjustedMMPvalue, drop = FALSE]
+
+
+# Sauvegarder les tableaux filtrés
+write.csv(filtered_geneModuleMembership, file = file.path(output_folder, "Filtered_GeneModuleMembership.csv"))
+write.csv(filtered_MMPvalue, file = file.path(output_folder, "Filtered_MMPvalue.csv"))
+write.csv(filtered_adjustedMMPvalue, file = file.path(output_folder, "Filtered_AdjustedMMPvalue.csv"))
+
+# Définir le seuil de significativité
+pvalue_threshold <- 0.05
+get_cell_type <- function(gene_name) {
+  if (!is.character(gene_name)) {
+    stop("gene_name must be a character string")
+  }
+  
+  if (startsWith(gene_name, "B_")) {
+    return("B lymphocytes")
+  } else if (startsWith(gene_name, "T_")) {
+    return("T lymphocytes")
+  } else if (startsWith(gene_name, "M_")) {
+    return("Monocytes")
+  } else if (startsWith(gene_name, "N_")) {
+    return("Neutrophiles")
+  } else {
+    return("Autre")
+  }
+}
+
+# Liste pour stocker les résultats
+gene_counts_per_module <- list()
+
+# Pour chaque module significatif, filtrer les gènes basés sur la corrélation et la p-value ajustée
+important_genes_per_module <- list()
+ # Remplacer par le chemin de sortie souhaité
+
+for (module in significant_modules_clean) {
+  # Extraire les colonnes pour le module actuel
+  correlations <- geneModuleMembership[, paste("MM", module, sep = "."), drop = FALSE]
+  pvalues <- MMPvalue[, paste("p.MM", module, sep = "."), drop = FALSE]
+  adjusted_pvalues <- adjustedMMPvalue[, paste("padj.MM", module, sep = "."), drop = FALSE]
+  
+  # Filtrer les gènes en fonction des p-values ajustées
+  significant_genes <- which(adjusted_pvalues[, 1] < pvalue_threshold)
+  
+  # Conserver les gènes avec des corrélations élevées et p-values ajustées significatives
+  important_genes <- correlations[significant_genes, , drop = FALSE]
+  important_genes <- cbind(important_genes, adjusted_pvalues[significant_genes, , drop = FALSE])
+  
+  # Ajouter les résultats à la liste
+  important_genes_per_module[[module]] <- important_genes
+}
+
+# Sauvegarder les résultats pour chaque module
+for (module in names(important_genes_per_module)) {
+  write.csv(important_genes_per_module[[module]], file = file.path(output_folder, paste("Important_Genes_", module, ".csv", sep = "")))
+  
+  # Extraire les gènes importants pour le module
+  genes <- rownames(important_genes_per_module[[module]])
+  
+  if (length(genes) > 0) {
+    # Identifier les types cellulaires
+    cell_types <- sapply(genes, get_cell_type)
+    
+    if (length(cell_types) > 0) {
+      # Compter le nombre de gènes par type cellulaire
+      gene_counts <- table(cell_types)
+      
+      # Ajouter les résultats à la liste
+      gene_counts_per_module[[module]] <- gene_counts
+    } else {
+      print(paste("Aucun type cellulaire identifié pour le module:", module))
+      gene_counts_per_module[[module]] <- table()
+    }
+  } else {
+    print(paste("Aucun gène trouvé pour le module:", module))
+    gene_counts_per_module[[module]] <- table()
+  }
+}
+
+# Convertir les résultats en data frame pour chaque module
+gene_counts_df <- do.call(rbind, lapply(names(gene_counts_per_module), function(module) {
+  counts <- gene_counts_per_module[[module]]
+  if (length(counts) > 0) {
+    counts_df <- as.data.frame(counts)
+    counts_df$Module <- module
+    counts_df
+  } else {
+    data.frame(Cell_Type = character(0), Count = integer(0), Module = module)
+  }
+}))
+
+# Ajuster les noms de colonnes pour plus de clarté
+colnames(gene_counts_df) <- c("Cell_Type", "Count", "Module")
+
+# Sauvegarder les résultats dans un fichier CSV
+output_file <- file.path(output_folder, "Gene_Counts_Per_Module.csv")
+write.csv(gene_counts_df, file = output_file, row.names = FALSE)
+
+
+cat("Step 19 : Interfacing network analysis with other data such as functional annotation and gene ontology .\n")
+
+
+# Fonction pour créer un dossier s'il n'existe pas
+create_folder_if_not_exists <- function(folder_path) {
+  if (!dir.exists(folder_path)) {
+    dir.create(folder_path)
+  }
+}
+# Fonction pour l'analyse d'enrichissement GO
+perform_GO_enrichment <- function(module, modLLIDs_clean, output_folder) {
+  GOenr <- enrichGO(gene = modLLIDs_clean,
+                    OrgDb = org.Hs.eg.db,
+                    keyType = "SYMBOL",
+                    ont = "BP",
+                    pAdjustMethod = "BH",
+                    qvalueCutoff = 0.05,
+                    readable = TRUE)
+  # Écriture des résultats d'enrichissement GO dans un fichier CSV
+  fileName_GO <- paste("GOEnrichmentTable-", module, ".csv", sep = "")
+  file_GO <- file.path(output_folder, "enrichissement_module", fileName_GO)
+  write.csv(GOenr, file = file_GO, row.names = FALSE)
+}
+# Créer le sous-dossier pour l'enrichissement GO
+enrich_folder <- file.path(output_folder, "enrichissement_module")
+create_folder_if_not_exists(enrich_folder)
+# Filtrer les modules significatifs à partir du tableau results_df
+significant_modules <- results_df %>%
+  filter(Significativite == "Significatif") %>%
+  pull(modules) %>%
+  gsub("^ME", "", .)  # Retirer le préfixe "ME" des noms des modules
+# Filtrer les gènes importants par module
+important_genes_per_module <- list()
+for (module in significant_modules) {
+  # Chargement des gènes importants pour le module
+  module_genes <- read.csv(file.path(output_folder, paste("Important_Genes_", module, ".csv", sep = "")), row.names = 1)
+  # Nettoyage des noms des gènes si nécessaire
+  modLLIDs_clean <- sub("^\\w+_", "", rownames(module_genes))
+  # Enregistrer les IDs de gènes du module dans un fichier texte
+  fileName_genes <- paste("LocusLinkIDs-", module, ".txt", sep = "")
+  file_genes <- file.path(enrich_folder, fileName_genes)
+  write.table(as.data.frame(modLLIDs_clean), file = file_genes, row.names = FALSE, col.names = FALSE, quote = FALSE)
+  # Effectuer l'analyse d'enrichissement GO
+  perform_GO_enrichment(module, modLLIDs_clean, output_folder)
+}
+
+cat("Step 20 : Identification des genes en communs dans tous les modules .\n")
+# Liste les fichiers dans le dossier
+files <- list.files(enrich_folder, pattern = "^LocusLinkIDs-", full.names = TRUE)
+# Initialiser une liste pour stocker les identifiants de gènes par module
+gene_lists <- list()
+# Lire chaque fichier et extraire les identifiants de gènes
+for (file in files) {
+  # Extraire le nom du module à partir du nom du fichier
+  module_name <- gsub("LocusLinkIDs-|\\.txt", "", basename(file))
+  # Lire les identifiants de gènes du fichier
+  gene_ids <- read.table(file, header = FALSE, stringsAsFactors = FALSE)$V1
+  # Assurer que les identifiants de gènes sont uniques
+  gene_ids <- unique(gene_ids)
+  # Ajouter les identifiants de gènes à la liste
+  gene_lists[[module_name]] <- gene_ids
+}
+# Créer le diagramme de Venn
+venn.plot <- venn.diagram(
+  x = gene_lists,
+  category.names = names(gene_lists),
+  filename = NULL,
+  output = TRUE,
+  col = rep("black", length(gene_lists)),
+  fill = rainbow(length(gene_lists)),  # Utiliser une couleur différente pour chaque module
+  cex = 1.5,
+  cat.cex = 1.2,
+  cat.col = rainbow(length(gene_lists)),
+  main = "Diagramme de Venn des gènes par module"
+)
+# Sauvegarder le diagramme de Venn en tant que fichier PNG
+output_file <- file.path(enrich_folder, "venn_diagram.png")
+png(filename = output_file, width = 800, height = 800, res = 150)
+grid.draw(venn.plot)
+dev.off()
+# Trouver les gènes communs à tous les modules
+common_genessss <- Reduce(intersect, gene_lists)
+# Créer un fichier texte pour les gènes communs
+common_genes_file <- file.path(enrich_folder, "common_genes.txt")
+write.table(common_genessss, file = common_genes_file, row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+cat("Step 21 : heatmap du niveau d'expression des genes en communs dans tous les types cellulaires .\n")
+#Filtrage des Gènes Communs 
+gene_communs <- as.data.frame(common_genessss)
+BLymphocytes_wgcna <- data_norm_BLymphocytes[data_norm_BLymphocytes$gene_id %in% gene_communs$common_genes,]
+TLymphocytes_wgcna <- data_norm_TLymphocytes[data_norm_TLymphocytes$gene_id %in% gene_communs$common_genes,]
+Monocytes_wgcna <- data_norm_Monocytes[data_norm_Monocytes$gene_id %in% gene_communs$common_genes,]
+Neutrophils_wgcna <- data_norm_Neutrophils[data_norm_Neutrophils$gene_id %in% gene_communs$common_genes,]
+
+#Trouver les Gènes Communs aux Quatre Types Cellulaires :
+
+genes_BLymphocytes <- unique(BLymphocytes_wgcna$gene_id)
+genes_TLymphocytes <- unique(TLymphocytes_wgcna$gene_id)
+genes_Monocytes <- unique(Monocytes_wgcna$gene_id)
+genes_Neutrophils <- unique(Neutrophils_wgcna$gene_id)
+common_genes <- Reduce(intersect, list(genes_BLymphocytes, genes_TLymphocytes, genes_Monocytes, genes_Neutrophils))
+Gene_communs <- data.frame(common_genes)
+#Filtrage des Tableaux pour Gènes Communs :
+
+BLymphocytes_wgcna <- BLymphocytes_wgcna[BLymphocytes_wgcna$gene_id %in% Gene_communs$common_genes,]
+TLymphocytes_wgcna <- TLymphocytes_wgcna[TLymphocytes_wgcna$gene_id %in% Gene_communs$common_genes,]
+Monocytes_wgcna <- Monocytes_wgcna[Monocytes_wgcna$gene_id %in% Gene_communs$common_genes,]
+Neutrophils_wgcna <- Neutrophils_wgcna[Neutrophils_wgcna$gene_id %in% Gene_communs$common_genes,]
+
+extract_numbers <- function(column_names) {
+  numbers <- gsub("\\D", "", column_names)
+  as.numeric(numbers)
+}
+
+filter_table <- function(data, filter_values) {
+  numeric_parts <- extract_numbers(colnames(data))
+  columns_to_keep <- colnames(data)[numeric_parts %in% filter_values]
+  if ("gene_id" %in% colnames(data)) {
+    columns_to_keep <- c("gene_id", columns_to_keep)
+  }
+  filtered_data <- data[, columns_to_keep, drop = FALSE]
+  return(filtered_data)
+}
+
+values_X <- unique(SJS$X)
+#Filtrage des Tableaux Basé sur des Valeurs Uniques 
+BLymphocytes_filtered <- filter_table(BLymphocytes_wgcna, values_X)
+TLymphocytes_filtered <- filter_table(TLymphocytes_wgcna, values_X)
+Monocytes_filtered <- filter_table(Monocytes_wgcna, values_X)
+Neutrophils_filtered <- filter_table(Neutrophils_wgcna, values_X)
+#Renommer les Colonnes Numériques 
+BLymphocytes_filtered <- rename_columns_numeric(BLymphocytes_filtered)
+TLymphocytes_filtered <- rename_columns_numeric(TLymphocytes_filtered)
+Monocytes_filtered <- rename_columns_numeric(Monocytes_filtered)
+Neutrophils_filtered <- rename_columns_numeric(Neutrophils_filtered)
+#Ajouter une Colonne cell_type et Combiner les Tableaux :
+
+BLymphocytes_filtered$cell_type <- 'B Lymphocytes'
+TLymphocytes_filtered$cell_type <- 'T Lymphocytes'
+Monocytes_filtered$cell_type <- 'Monocytes'
+Neutrophils_filtered$cell_type <- 'Neutrophils'
+
+combined_data <- bind_rows(BLymphocytes_filtered, TLymphocytes_filtered, Monocytes_filtered, Neutrophils_filtered)
+combined_data <- combined_data %>% rename(gene_id = `...1`)
+#Réorganiser les Données au Format Long :
+melted_data <- melt(combined_data, id.vars = c('gene_id', 'cell_type'), variable.name = 'metric', value.name = 'expression')
+
+# Reformatage des données pour heatmap
+heatmap_data <- dcast(melted_data, gene_id ~ cell_type, value.var = 'expression', fun.aggregate = mean)
+
+# Assurez-vous que les valeurs sont numériques
+heatmap_data_matrix <- as.matrix(heatmap_data[, -1])
+rownames(heatmap_data_matrix) <- heatmap_data$gene_id
+
+# Réduire les noms des types cellulaires
+# Créez une version abrégée des noms des types cellulaires
+abbreviations <- c("B Lymphocytes" = "B-Lym", 
+                   "T Lymphocytes" = "T-Lym", 
+                   "Monocytes" = "Mono", 
+                   "Neutrophils" = "Neutro")
+
+# Réorganiser les colonnes pour correspondre aux nouvelles abréviations
+colnames(heatmap_data_matrix) <- abbreviations[colnames(heatmap_data_matrix)]
+
+# Créer la heatmap avec pheatmap
+pheatmap(heatmap_data_matrix, 
+         cluster_rows = TRUE, 
+         cluster_cols = FALSE, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         display_numbers = FALSE, 
+         fontsize = 12,
+         fontsize_row = 8,
+         fontsize_col = 8,
+         number_format = "%.2f", # Format des nombres
+         legend = TRUE,         # Assure que la légende est affichée
+         annotation_colors = list(
+           cell_type = c(
+             "B-Lym" = "blue",
+             "T-Lym" = "green",
+             "Mono" = "yellow",
+             "Neutro" = "red"
+           )
+         ),
+         annotation_names_col = TRUE, # Afficher les noms de colonnes annotés
+         filename = file.path(output_folder, "Heatmap_Expression_Genes_in_sjogren.png")) # Enregistrer l'image
+
+results_df$Significativite <- factor(results_df$Significativite, levels = c("Significatif", "Non significatif"))
+# Créer le graphique à barres sans les chiffres devant les barres
+sig <- ggplot(results_df, aes(x = reorder(modules, -Padjusted), y = Pvalue, fill = Significativite)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("Significatif" = "red", "Non significatif" = "blue")) +
+  theme_minimal() +
+  labs(title = "Modules Significatifs",
+       x = "Modules",
+       y = "Padjusted",
+       fill = "Significativité") +
+  theme(panel.background = element_rect(fill = "white", color = "black"),
+        plot.background = element_rect(fill = "white", color = "white"),
+        legend.position = "bottom")
+
+ggsave(filename = file.path(output_folder, paste("Modulessignificatif.png")),
+           plot = sig,
+           width = 12, height = 8, units = "in")
+
+# Créer le graphique à barres groupées
+sav <- ggplot(gene_counts_df, aes(x = Module, y = Count, fill = Cell_Type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  theme_minimal() +
+  labs(title = "Nombre de gènes par type cellulaire dans chaque module significatif",
+       x = "Modules significatifs",
+       y = "Nombre de gènes",
+       fill = "Type Cellulaire") +
+  theme(panel.background = element_rect(fill = "white", color = "black"),
+        plot.background = element_rect(fill = "white", color = "white"),
+        legend.position = "bottom") +
+  scale_fill_brewer(palette = "Set1") # Utiliser une palette de couleurs agréable
+
+# Sauvegarder le graphique
+ggsave(filename = file.path(output_folder, "gene_counts_by_module_and_cell_type.png"), width = 10,plot = sav , height = 6, dpi = 300)
+
+# Sauvegarde de l'historique des commandes exécutées
+savehistory(file.path(output_folder, "mWGCNA_sjogren_sauvegarde_generale.Rhistory"))
+
+cat("Step 22 : #Analyse specifique au module saumon 
+#heatmap des genes regulée positivements communs au differents type cellulaire dans le modules saumon sans avoir besoin de relancer toutes les anlyses on peut directement commencer à partir de là .\n")
+
+
+data_norm_BLymphocytes <- read.csv("D:/data_umr_1227/Par_pureté_cyto_digitale/BLymphocytes_DESeq/Sizefactornorm_all_sampleBLymphocytes_DESeq.csv")
+data_norm_TLymphocytes <- read.csv("D:/data_umr_1227/Par_pureté_cyto_digitale/TLymphocytes_DESeq/Sizefactornorm_all_sampleTLymphocytes_DESeq.csv")
+data_norm_Monocytes <- read.csv("D:/data_umr_1227/Par_pureté_cyto_digitale/Monocytes_DESeq/Sizefactornorm_all_sampleMonocytes_DESeq.csv")
+data_norm_Neutrophils <- read.csv("D:/data_umr_1227/Par_pureté_cyto_digitale/Neutrophils_DESeq/Sizefactornorm_all_sampleNeutrophils_DESeq.csv")
+
+distribution_datA <- read.csv("D:/data_umr_1227/Par_pureté_cyto_digitale/MOFA_analysis_26/distribution_tableau.csv")
+gene_name <- read.csv("D:/data_umr_1227/Par_pureté_cyto_digitale/mart_export.csv")
+
+
+genes_saumon_B <- read.table("D:/data_umr_1227/Par_pureté_cyto_digitale/WGCNA_analysis/With_cell_discrimination/Salmon/genes_B_pos", header= FALSE, sep = ",")
+
+genes_saumon_T <- read.table("D:/data_umr_1227/Par_pureté_cyto_digitale/WGCNA_analysis/With_cell_discrimination/Salmon/genes_T_pos", header= FALSE, sep = ",")
+
+genes_saumon_M <- read.table("D:/data_umr_1227/Par_pureté_cyto_digitale/WGCNA_analysis/With_cell_discrimination/Salmon/genes_M_pos", header= FALSE, sep = ",")
+
+genes_saumon_N <- read.table("D:/data_umr_1227/Par_pureté_cyto_digitale/WGCNA_analysis/With_cell_discrimination/Salmon/genes_N_pos", header= FALSE, sep = ",")
+
+genes_B <- genes_saumon_B$V1
+genes_T <- genes_saumon_T$V1
+genes_M <- genes_saumon_M$V1
+genes_N <- genes_saumon_N$V1
+
+common_genes <- Reduce(intersect, list(genes_B, genes_T, genes_M, genes_N))
+# Convertir en data frame si nécessaire
+module_saumon  <- data.frame(common_genes)
+
+
+
+
+process_dataframe <- function(data_norm, gene_name) {
+  merged_df <- merge(data_norm, gene_name, by.x = "X", by.y = "Gene.stable.ID", all.x = TRUE)
+  merged_df$Gene.name[is.na(merged_df$Gene.name)] <- merged_df$X[is.na(merged_df$Gene.name)]
+  merged_df <- subset(merged_df, select = -X)
+  names(merged_df) <- sub("^X", "", names(merged_df))
+  return(merged_df)
+}
+
+SF_BLymphocytes <- process_dataframe(data_norm_BLymphocytes, gene_name)
+SF_TLymphocytes <- process_dataframe(data_norm_TLymphocytes, gene_name)
+SF_Monocytes <- process_dataframe(data_norm_Monocytes, gene_name)
+SF_Neutrophiles <- process_dataframe(data_norm_Neutrophils, gene_name)
+
+SJS  <- distribution_datA[distribution_datA$CONDITION == 'SJS', ]
+CTRL  <- distribution_datA[distribution_datA$CONDITION == 'CTRL', ]
+
+
+
+BLymphocytes <- SF_BLymphocytes[SF_BLymphocytes$Gene.name%in%module_saumon$common_genes,]
+TLymphocytes <- SF_TLymphocytes[SF_TLymphocytes$Gene.name%in%module_saumon$common_genes,]
+Monocytes <- SF_Monocytes[SF_Monocytes$Gene.name%in%module_saumon$common_genes,]
+Neutophiles <- SF_Neutrophiles[SF_Neutrophiles$Gene.name%in%module_saumon$common_genes,]
+
+# Fonction pour extraire les parties numériques des noms de colonnes
+extract_numbers <- function(column_names) {
+  # Utiliser une expression régulière pour extraire les chiffres
+  numbers <- gsub("\\D", "", column_names)
+  as.numeric(numbers)
+}
+
+# Fonction pour filtrer un tableau
+filter_table <- function(data, filter_values) {
+  # Extraire les parties numériques des noms de colonnes de `data`
+  numeric_parts <- extract_numbers(colnames(data))
+  # Trouver les colonnes dont les parties numériques sont dans filter_values
+  columns_to_keep <- colnames(data)[numeric_parts %in% filter_values]
+  # Toujours inclure la colonne gene_id dans le résultat
+  if ("Gene.name" %in% colnames(data)) {
+    columns_to_keep <- c("Gene.name", columns_to_keep)
+  }
+  # Filtrer le tableau pour garder uniquement ces colonnes
+  filtered_data <- data[, columns_to_keep, drop = FALSE]
+  return(filtered_data)
+}
+
+rename_columns_numeric <- function(data) {
+  colnames(data) <- gsub("[^0-9]", "", colnames(data))
+  return(data)
+}
+
+
+values_Y <- unique(CTRL$ID)
+
+
+# Appliquer la fonction de filtrage à chaque tableau
+BLymphocytes_filtered <- filter_table(BLymphocytes, values_Y)
+TLymphocytes_filtered <- filter_table(TLymphocytes, values_Y)
+Monocytes_filtered <- filter_table(Monocytes, values_Y)
+Neutrophils_filtered <- filter_table(Neutophiles, values_Y)
+
+
+BLymphocytes_filtered  <- rename_columns_numeric(BLymphocytes_filtered)
+TLymphocytes_filtered  <- rename_columns_numeric(TLymphocytes_filtered )
+Monocytes_filtered <- rename_columns_numeric(Monocytes_filtered)
+Neutrophils_filtered <- rename_columns_numeric(Neutrophils_filtered)
+
+
+# Ajoutez une colonne 'cell_type' à chaque tableau
+BLymphocytes_filtered$cell_type <- 'B Lymphocytes'
+TLymphocytes_filtered$cell_type <- 'T Lymphocytes'
+Monocytes_filtered$cell_type <- 'Monocytes'
+Neutrophils_filtered$cell_type <- 'Neutrophiles'
+
+
+# Combinez les tableaux en un seul tableau long
+combined_data <- bind_rows(BLymphocytes_filtered, TLymphocytes_filtered, Monocytes_filtered, Neutrophils_filtered)
+
+combined_data <- combined_data%>% rename(gene_id = `...1`)
+
+handle_na <- function(matrix_data) {
+  matrix_data[is.na(matrix_data)] <- 0
+  return(matrix_data)
+}
+
+combined_data <- handle_na(combined_data)
+
+# Réorganiser les données au format long
+melted_data <- melt(combined_data, id.vars = c('gene_id', 'cell_type'), variable.name = 'metric', value.name = 'expression')
+
+# Reformatage des données pour heatmap
+heatmap_data <- dcast(melted_data, gene_id ~ cell_type, value.var = 'expression', fun.aggregate = mean)
+
+# Assurez-vous que les valeurs sont numériques
+heatmap_data_matrix <- as.matrix(heatmap_data[, -1])
+rownames(heatmap_data_matrix) <- heatmap_data$gene_id
+
+# Réduire les noms des types cellulaires
+# Créez une version abrégée des noms des types cellulaires
+abbreviations <- c("B Lymphocytes" = "B-Lym", 
+                   "T Lymphocytes" = "T-Lym", 
+                   "Monocytes" = "Mono", 
+                   "Neutrophiles" = "Neutro")
+
+# Réorganiser les colonnes pour correspondre aux nouvelles abréviations
+colnames(heatmap_data_matrix) <- abbreviations[colnames(heatmap_data_matrix)]
+
+# Créer la heatmap avec pheatmap
+pheatmap(heatmap_data_matrix, 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE, 
+         color = colorRampPalette(c("black", "white", "red"))(100),
+         display_numbers = FALSE, 
+         fontsize = 10,
+         fontsize_row = 4,
+         fontsize_col = 8,
+         number_format = "%.2f", # Format des nombres
+         legend = TRUE,         # Assure que la légende est affichée
+         annotation_colors = list(
+           cell_type = c(
+             "B-Lym" = "blue",
+             "T-Lym" = "green",
+             "Mono" = "yellow",
+             "Neutro" = "red"
+           )
+         ),
+         annotation_names_col = TRUE, filename = file.path(output_folder, "Heatmap_variation_Expression_sno_CTRL.png")) 
+
+write.csv(heatmap_data, file = file.path(output_folder, "snoRNA_CTRL.csv"), row.names = FALSE)
+write.csv(module_saumon$common_genes, file = file.path(output_folder, "Sno_gene_list.csv"), row.names = FALSE)
+
+
+```
+
