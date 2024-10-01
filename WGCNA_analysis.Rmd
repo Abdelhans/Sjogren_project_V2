@@ -776,9 +776,6 @@ common_genes <- Reduce(intersect, list(genes_B, genes_T, genes_M, genes_N))
 # Convertir en data frame si nécessaire
 module_saumon  <- data.frame(common_genes)
 
-
-
-
 process_dataframe <- function(data_norm, gene_name) {
   merged_df <- merge(data_norm, gene_name, by.x = "X", by.y = "Gene.stable.ID", all.x = TRUE)
   merged_df$Gene.name[is.na(merged_df$Gene.name)] <- merged_df$X[is.na(merged_df$Gene.name)]
@@ -908,6 +905,146 @@ pheatmap(heatmap_data_matrix,
 
 write.csv(heatmap_data, file = file.path(output_folder, "snoRNA_CTRL.csv"), row.names = FALSE)
 write.csv(module_saumon$common_genes, file = file.path(output_folder, "Sno_gene_list.csv"), row.names = FALSE)
+
+
+cat("Step 23 : #Analyse de correlation des snoRNA avec les donées cliniques numériques.\n")
+
+library(dplyr)
+library(readr)
+library(corrr)
+library(vroom)
+library(ggplot2)
+
+
+# Charger les données cliniques numériques
+data_clinical_num <- vroom("D:/data_umr_1227/Par_purete_cyto_digitales/Sjogren_project_V2/CLINICAL_NUMERIC_STRD_SJS.tsv", delim = '\t')
+
+data_norm_BLymphocytes <- read.csv("D:/data_umr_1227/Par_purete_cyto_digitales/Sjogren_project_V2/BLymphocytes_DESeq/VST_normalized_all_sampleBLymphocytes_DESeq.csv", check.names = FALSE)
+data_norm_TLymphocytes <- read.csv("D:/data_umr_1227/Par_purete_cyto_digitales/Sjogren_project_V2/TLymphocytes_DESeq/VST_normalized_all_sampleTLymphocytes_DESeq.csv", check.names = FALSE)
+data_norm_Monocytes <- read.csv("D:/data_umr_1227/Par_purete_cyto_digitales/Sjogren_project_V2/Monocytes_DESeq/VST_normalized_all_sampleMonocytes_DESeq.csv", check.names = FALSE)
+data_norm_Neutrophils <- read.csv("D:/data_umr_1227/Par_purete_cyto_digitales/Sjogren_project_V2/Neutrophils_DESeq/VST_normalized_all_sampleNeutrophils_DESeq.csv", check.names = FALSE)
+
+snoRNA_gene_list <- read.csv("D:/data_umr_1227/Par_purete_cyto_digitales/Sjogren_project_V2/WGCNA_analysis/Sno_gene_list.csv", check.names = FALSE)
+
+
+# Fonction pour filtrer les gènes snoRNA
+filter_snoRNA_genes <- function(data_norm, snoRNA_list) {
+  colnames(data_norm) <- gsub("(_.*$)", "", colnames(data_norm))
+  colnames(data_norm)[1] <- "ID"
+  filtered_data <- data_norm[data_norm[, 1] %in% snoRNA_list$x, ]
+  return(filtered_data)
+}
+
+# Fonction principale pour le traitement des données d'un type cellulaire
+process_cell_type <- function(cell_type, data_norm, clinical_data, snoRNA_gene_list, output_base_dir) {
+  # Filtrer les gènes snoRNA
+  snoRNA_data <- filter_snoRNA_genes(data_norm, snoRNA_gene_list)
+
+  # Transposer les données
+  snoRNA_data_t <- as.data.frame(t(snoRNA_data[-1]))
+  colnames(snoRNA_data_t) <- snoRNA_data$ID
+  snoRNA_data_t <- cbind(ID = rownames(snoRNA_data_t), snoRNA_data_t)
+
+  # Calculer la moyenne des expressions des gènes snoRNA
+  snoRNA_data_t$Mean_snoRNA_expression <- rowMeans(snoRNA_data_t[, -1], na.rm = TRUE)
+
+  # Fusionner avec les données cliniques
+  merged_data <- merge(clinical_data, snoRNA_data_t[, c("ID", "Mean_snoRNA_expression")], by = "ID", all.x = TRUE)
+
+  # Créer une liste pour stocker les résultats
+  results_list <- list()
+
+  # Boucle sur chaque variable clinique
+  for (variable in colnames(clinical_data)[-1]) {  # Exclure la colonne ID
+    temp_data <- merged_data[complete.cases(merged_data[, c(variable, "Mean_snoRNA_expression")]), ]
+
+    # Vérifier les conditions pour le test de corrélation
+    if (nrow(temp_data) >= 4 && var(temp_data[[variable]], na.rm = TRUE) > 0) {
+      correlation_test <- try(cor.test(temp_data[[variable]], temp_data$Mean_snoRNA_expression), silent = TRUE)
+
+      if (!inherits(correlation_test, "try-error")) {
+        results_list[[variable]] <- data.frame(
+          Variable = variable,
+          Pvalue = correlation_test$p.value,
+          Cor = correlation_test$estimate
+        )
+      }
+    }
+  }
+
+  # Concaténer les résultats dans un dataframe
+  adjusted_results_df <- do.call(rbind, results_list)
+  adjusted_results_df$Padjusted <- p.adjust(adjusted_results_df$Pvalue, method = "fdr")
+  adjusted_results_df$Significativite <- ifelse(adjusted_results_df$Pvalue <= 0.05, "Significatif", "Non significatif")
+  variable_significative <- adjusted_results_df[adjusted_results_df$Significativite == "Significatif", ]
+
+# Créer le dossier de sortie pour le type cellulaire
+output_folder <- file.path(output_base_dir, gsub(" ", "_", cell_type))  # Remplacer les espaces par des underscores
+dir.create(output_folder, showWarnings = FALSE, recursive = TRUE)  # Ajouter recursive = TRUE pour créer tous les sous-dossiers
+
+# Vérifier si le dossier a été créé avec succès
+if (!dir.exists(output_folder)) {
+  stop(paste("Failed to create directory:", output_folder))
+}
+
+
+  # Sauvegarder les résultats
+  write.csv(adjusted_results_df, file.path(output_folder, "correlation_variable_numeric.csv"), row.names = FALSE)
+  write.csv(variable_significative, file.path(output_folder, "variable_numeric_signif.csv"), row.names = FALSE)
+
+  # Fonction pour sauvegarder les scatterplots
+  save_scatterplots <- function(data, variable_significative, output_dir) {
+    plots <- list()
+    for (i in 1:nrow(variable_significative)) {
+      variable_name <- variable_significative[i, "Variable"]
+      temp_data <- data.frame(
+        Mean = data$Mean_snoRNA_expression,
+        Variable = data[[variable_name]]
+      )
+      temp_data <- temp_data[complete.cases(temp_data), ]
+
+      if (nrow(temp_data) > 0) {
+        p_value <- calculate_pvalue(temp_data)
+        correlation <- cor(temp_data$Mean, temp_data$Variable)
+
+        plot <- ggplot(temp_data, aes(x = Mean, y = Variable)) +
+          geom_point() +
+          geom_smooth(method = "lm", se = TRUE, color = "red") +
+          labs(title = paste("Scatterplot for", variable_name, "\nP-value:", format(p_value, digits = 3), "\nCor:", format(correlation, digits = 3)),
+               x = "Mean snoRNA Expression", y = variable_name)
+
+        variable_name_clean <- gsub("[^A-Za-z0-9]", "", variable_name)
+        plot_filename <- file.path(output_dir, paste0("scatterplot_Mean_", variable_name_clean, ".png"))
+        ggsave(filename = plot_filename, plot = plot, width = 7, height = 5)
+
+        plots[[i]] <- plot
+      }
+    }
+    return(plots)
+  }
+
+  # Sauvegarder les scatterplots
+  scatterplots <- save_scatterplots(merged_data, adjusted_results_df[adjusted_results_df$Significativite == "Significatif", ], output_folder)
+
+  cat(paste(cell_type, "scatterplots saved successfully.\n"))
+}
+# Fonction pour calculer la p-value d'une régression linéaire
+calculate_pvalue <- function(data) {
+  model <- lm(Variable ~ Mean, data = data)
+  summary_model <- summary(model)
+  p_value <- summary_model$coefficients[2, 4]
+  return(p_value)
+}
+
+
+# Définir le répertoire de sortie de base
+output_base_dir <- "D:/data_umr_1227/Par_purete_cyto_digitales/Sjogren_project_V2/WGCNA_analysis/snoRNA_correlation"
+
+# Traiter chaque type cellulaire
+process_cell_type("Lymphocytes B", data_norm_BLymphocytes, data_clinical_num, snoRNA_gene_list, output_base_dir)
+process_cell_type("Lymphocytes T", data_norm_TLymphocytes, data_clinical_num, snoRNA_gene_list, output_base_dir)
+process_cell_type("Monocytes", data_norm_Monocytes, data_clinical_num, snoRNA_gene_list, output_base_dir)
+process_cell_type("Neutrophils", data_norm_Neutrophils, data_clinical_num, snoRNA_gene_list, output_base_dir)
 
 
 ```
